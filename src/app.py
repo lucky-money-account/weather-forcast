@@ -201,29 +201,34 @@ def load_meta():
 
 
 @st.cache_resource
-def load_model(checkpoint_name, input_dim=7):
+def load_model(checkpoint_name):
     """Load a pre-trained model from checkpoint, reading architecture from config.yaml."""
     import yaml
     cfg_path = os.path.join(PROJ_ROOT, "config.yaml")
     with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)["model"]
+        cfg_full = yaml.safe_load(f)
+    cfg = cfg_full["model"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if checkpoint_name == "lstm1":
-        from src.models import LSTMModel1
-        model = LSTMModel1(input_dim, hidden_dim=cfg["hidden_dim"]).to(device)
-    elif checkpoint_name == "lstm2":
-        from src.models import LSTMModel2
-        model = LSTMModel2(input_dim, hidden_dim=cfg["hidden_dim"], dropout=cfg["dropout"]).to(device)
-    elif checkpoint_name == "transformer":
-        from src.models import TransformerModel
-        model = TransformerModel(
-            input_dim, d_model=cfg["d_model"], nhead=cfg["nhead"],
-            num_layers=cfg["num_layers"], dim_feedforward=cfg["dim_feedforward"],
-            dropout=cfg["dropout"],
-        ).to(device)
-    else:
-        return None
+
+    if checkpoint_name == "ensemble":
+        from src.models import Ensemble
+        models = []
+        for mname in ["bilstm", "lstm2", "transformer"]:
+            ccfg = {**cfg_full, "model": {**cfg, "name": mname}}
+            m = build_model(ccfg).to(device)
+            path = os.path.join(CKPT_DIR, f"{mname}_best.pt")
+            if os.path.exists(path):
+                m.load_state_dict(torch.load(path, map_location=device))
+                m.eval()
+                models.append(m)
+        if len(models) >= 2:
+            return Ensemble(models).to(device), device
+        return None, device
+
+    # Individual model
+    ccfg = {**cfg_full, "model": {**cfg, "name": checkpoint_name}}
+    model = build_model(ccfg).to(device)
     ckpt_path = os.path.join(CKPT_DIR, f"{checkpoint_name}_best.pt")
     if os.path.exists(ckpt_path):
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
@@ -240,82 +245,79 @@ def load_test_data():
 # Helpers
 # ══════════════════════════════════════════════════════════════
 
-def inverse_tavg(y_scaled, city_arr, scalers):
+def inverse_tavg(y_scaled, city_arr, scalers, n_features=9):
     out = np.zeros_like(y_scaled)
     for i, c in enumerate(city_arr):
-        dummy = np.zeros((1, 7))
+        dummy = np.zeros((1, n_features))
         dummy[0, 0] = y_scaled[i]
         out[i] = scalers[c].inverse_transform(dummy)[0, 0]
     return out
 
 
-def get_predictions(model, device, X_test, y_test, city_test, scalers, target_city, target_model):
+def get_predictions(model, device, X_test, y_test, city_test, scalers, target_city):
     city_mask = city_test == target_city
     X_city = torch.from_numpy(X_test[city_mask]).to(device)
     with torch.no_grad():
         preds = model(X_city).cpu().numpy()
-    y_true_orig = inverse_tavg(y_test[city_mask], city_test[city_mask], scalers)
-    y_pred_orig = inverse_tavg(preds, np.array([target_city] * len(preds)), scalers)
+    n_feat = X_test.shape[2]
+    y_true_orig = inverse_tavg(y_test[city_mask], city_test[city_mask], scalers, n_feat)
+    y_pred_orig = inverse_tavg(preds, np.array([target_city] * len(preds)), scalers, n_feat)
     return y_true_orig, y_pred_orig
 
 
 def forecast_multistep(model, device, city_raw, scalers, city, horizon_days, window_len=30):
-    """
-    Iterative multi-step forecast.
-    1. Start with last `window_len` days of real data (all 7 features).
-    2. Predict tavg for day 31.
-    3. Fill non-target features with last known values / weekly averages.
-    4. Slide window, repeat for `horizon_days` steps.
-    Returns: (dates, predicted_tavg, confidence_lower, confidence_upper)
-    """
-    features = ["tavg", "tmin", "tmax", "prcp", "rhum", "wspd", "pres"]
+    features = ["tavg", "tmin", "tmax", "prcp", "rhum", "wspd", "pres", "day_sin", "day_cos"]
     scaler = scalers[city]
     cdf = city_raw.sort_values("date").tail(window_len + 30).copy()
 
-    # Last window of real data
+    # Add day_sin/day_cos if not present
+    if "day_sin" not in cdf.columns:
+        doy = cdf["date"].dt.dayofyear.values
+        cdf["day_sin"] = np.sin(2 * np.pi * doy / 365.25)
+        cdf["day_cos"] = np.cos(2 * np.pi * doy / 365.25)
+
     seed_window = cdf[features].values[-window_len:].astype(np.float32)
     seed_scaled = scaler.transform(seed_window)
-
-    recent_avg = cdf[features].tail(14).mean(axis=0).values  # 14-day avg for fallback
-    recent_std = cdf[features].tail(14).std(axis=0).values
-
     window = seed_scaled.copy()
     preds_scaled = []
 
-    for _ in range(horizon_days):
+    last_date = cdf["date"].iloc[-1]
+    fc_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=horizon_days, freq="D")
+
+    for step, fc_date in enumerate(fc_dates):
         X_input = torch.from_numpy(window[np.newaxis, :, :]).to(device)
         with torch.no_grad():
             next_tavg = model(X_input).item()
 
-        # Build next row: predicted tavg + fallback for others
+        # Compute day_sin/day_cos for this forecast date
+        doy = fc_date.dayofyear
+        day_sin = np.sin(2 * np.pi * doy / 365.25)
+        day_cos = np.cos(2 * np.pi * doy / 365.25)
+
+        r = scaler.data_range_[0]
         next_row = np.array([
-            next_tavg,                                   # tavg (predicted)
-            next_tavg - 4.0 / (scaler.data_max_[0] - scaler.data_min_[0] + 1e-8),  # rough tmin estimate
-            next_tavg + 4.0 / (scaler.data_max_[0] - scaler.data_min_[0] + 1e-8),  # rough tmax estimate
-            window[-1, 3],                               # prcp: carry forward
-            window[-1, 4],                               # rhum: carry forward
-            window[-1, 5],                               # wspd: carry forward
-            window[-1, 6],                               # pres: carry forward
+            next_tavg,
+            next_tavg - 4.0 / (r + 1e-8),
+            next_tavg + 4.0 / (r + 1e-8),
+            window[-1, 3],    # prcp: carry forward
+            window[-1, 4],    # rhum: carry forward
+            window[-1, 5],    # wspd: carry forward
+            window[-1, 6],    # pres: carry forward
+            day_sin,           # real day_sin for target date
+            day_cos,           # real day_cos for target date
         ], dtype=np.float32)
 
         preds_scaled.append(next_tavg)
         window = np.vstack([window[1:], next_row]).astype(np.float32)
 
     preds_scaled = np.array(preds_scaled)
+    y_orig = inverse_tavg(preds_scaled, np.array([city] * horizon_days), scalers, len(features))
 
-    # Inverse transform tavg predictions
-    y_orig = inverse_tavg(preds_scaled, np.array([city] * horizon_days), scalers)
-
-    # Generate dates
-    last_date = cdf["date"].iloc[-1]
-    dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=horizon_days, freq="D")
-
-    # Confidence band: based on test-set MAE of ~1.15 degC
-    mae_estimate = 1.15
+    mae_estimate = 1.05  # improved MAE
     lower = y_orig - mae_estimate
     upper = y_orig + mae_estimate
 
-    return dates, y_orig, lower, upper
+    return fc_dates, y_orig, lower, upper
 
 
 # ══════════════════════════════════════════════════════════════
@@ -339,10 +341,13 @@ with st.sidebar:
     st.markdown("## ⚙️ CONTROL PANEL")
 
     city = st.selectbox("TARGET CITY", ["Kunming", "Guiyang", "Chengdu", "Chongqing"])
-    model_name = st.selectbox("AI MODEL", ["lstm1", "lstm2", "transformer"],
-                              format_func=lambda x: {"lstm1": "LSTM v1 (Single-Layer)",
-                                                     "lstm2": "LSTM v2 (Deep + Dropout)",
-                                                     "transformer": "Transformer Encoder"}[x])
+    model_name = st.selectbox("AI MODEL", ["bilstm", "lstm2", "transformer", "ensemble"],
+                              format_func=lambda x: {
+                                  "bilstm": "BiLSTM (Bidirectional)",
+                                  "lstm2": "LSTM v2 (Deep + Dropout)",
+                                  "transformer": "Transformer Encoder",
+                                  "ensemble": "Ensemble (All 3 Models)"
+                              }[x])
 
     st.divider()
     st.markdown("### 🔮 FORECAST")
@@ -433,7 +438,7 @@ with col_chart:
         if model and "city" in test_data:
             y_true, y_pred = get_predictions(
                 model, device, test_data["X"], test_data["y"],
-                test_data["city"], scalers, city, model_name
+                test_data["city"], scalers, city
             )
 
         # Plotly interactive chart

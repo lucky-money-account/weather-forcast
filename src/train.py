@@ -98,9 +98,10 @@ def main():
         lr=cfg["train"]["learning_rate"],
         weight_decay=cfg["train"]["weight_decay"],
     )
-    patience = cfg["train"]["patience"]
+    scheduler_patience = cfg["train"]["patience"]
+    early_stop = cfg["train"].get("early_stop_patience", scheduler_patience * 2)
     scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=cfg["train"]["factor"], patience=patience,
+        optimizer, mode="min", factor=cfg["train"]["factor"], patience=scheduler_patience,
     )
     clip_norm = cfg["train"]["grad_clip_norm"]
     epochs = cfg["train"]["epochs"]
@@ -114,7 +115,7 @@ def main():
     print(f"  Model: {model_name} ({param_count:,} params)")
     print(f"  Loss: {cfg['train']['loss']} | Device: {device}")
     print(f"  Epochs: {epochs} | Batch: {batch_size} | LR: {cfg['train']['learning_rate']}")
-    print(f"  Patience: {patience} (early stopping)")
+    print(f"  Patience: {scheduler_patience} (scheduler) / {early_stop} (early stop)")
     print(f"{'='*60}")
 
     best_val, best_ep = float("inf"), 0
@@ -143,7 +144,7 @@ def main():
             print(f"  Epoch {ep:3d}/{epochs} | "
                   f"Train: {tr_loss:.6f} | Val: {val_loss:.6f} | LR: {lr:.2e}{flag}")
 
-        if stale >= patience * 2:
+        if stale >= early_stop:
             print(f"\n  Early stopping: no improvement for {stale} epochs.")
             break
 

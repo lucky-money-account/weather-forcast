@@ -240,7 +240,7 @@ def preprocess(df, cfg, today):
     wlen = cfg["window"]["window_len"]
     horizon = cfg["window"]["horizon"]
 
-    print("[*] Preprocessing: clean + scale + windows + split ...")
+    print("[*] Preprocessing: clean + time features + scale + windows + split ...")
 
     df = df.sort_values(["city", "date"]).copy()
     for col in features:
@@ -248,6 +248,13 @@ def preprocess(df, cfg, today):
         df[col] = df.groupby("city")[col].transform(
             lambda s: s.interpolate(method="linear", limit_direction="both").ffill().bfill()
         )
+
+    # Add cyclical time features (day of year -> sin/cos)
+    doy = df["date"].dt.dayofyear.values
+    df["day_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    df["day_cos"] = np.cos(2 * np.pi * doy / 365.25)
+    features = features + ["day_sin", "day_cos"]
+    print(f"    Features ({len(features)}): {features}")
 
     missing = df[features].isna().sum()
     if missing.sum() > 0:

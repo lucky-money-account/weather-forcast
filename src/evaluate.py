@@ -36,11 +36,10 @@ def load_config():
         return yaml.safe_load(f)
 
 
-def inverse_tavg(y_scaled, city_arr, scalers):
-    """将归一化 tavg 反变换回原始 degC"""
+def inverse_tavg(y_scaled, city_arr, scalers, n_features):
     out = np.zeros_like(y_scaled)
     for i, c in enumerate(city_arr):
-        dummy = np.zeros((1, 7))
+        dummy = np.zeros((1, n_features))
         dummy[0, 0] = y_scaled[i]
         out[i] = scalers[c].inverse_transform(dummy)[0, 0]
     return out
@@ -109,29 +108,33 @@ def main():
 
     test = np.load(os.path.join(data_dir, "test.npz"))
     X_test, y_test, city_test = test["X"], test["y"], test["city"]
+    n_features = X_test.shape[2]
     scalers = pickle.load(open(os.path.join(data_dir, "scalers.pkl"), "rb"))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    y_true_orig = inverse_tavg(y_test, city_test, scalers)
+    y_true_orig = inverse_tavg(y_test, city_test, scalers, n_features)
     all_metrics = {}
 
     for mname in model_names:
-        print(f"\n{'='*60}\n  Evaluating: {mname}\n{'='*60}")
-
-        # 构建模型并从 checkpoint 加载
-        cfg_copy = cfg.copy()
-        cfg_copy["model"] = {**cfg["model"], "name": mname}
-        model = build_model(cfg_copy).to(device)
-        ckpt_path = os.path.join(ckpt_dir, f"{mname}_best.pt")
-        if not os.path.exists(ckpt_path):
-            print(f"  [SKIP] Checkpoint not found: {ckpt_path}")
-            continue
-        model.load_state_dict(torch.load(ckpt_path, map_location=device))
-        model.eval()
+        if mname == "ensemble":
+            from models import build_ensemble
+            model = build_ensemble(cfg, ckpt_dir)
+            model.eval()
+        else:
+            print(f"\n{'='*60}\n  Evaluating: {mname}\n{'='*60}")
+            cfg_copy = cfg.copy()
+            cfg_copy["model"] = {**cfg["model"], "name": mname}
+            model = build_model(cfg_copy).to(device)
+            ckpt_path = os.path.join(ckpt_dir, f"{mname}_best.pt")
+            if not os.path.exists(ckpt_path):
+                print(f"  [SKIP] Checkpoint not found: {ckpt_path}")
+                continue
+            model.load_state_dict(torch.load(ckpt_path, map_location=device))
+            model.eval()
 
         with torch.no_grad():
             preds = model(torch.from_numpy(X_test).to(device)).cpu().numpy()
-        y_pred_orig = inverse_tavg(preds, city_test, scalers)
+        y_pred_orig = inverse_tavg(preds, city_test, scalers, n_features)
 
         mae = mean_absolute_error(y_true_orig, y_pred_orig)
         rmse = np.sqrt(mean_squared_error(y_true_orig, y_pred_orig))
