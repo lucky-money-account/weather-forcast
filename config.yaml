@@ -1,0 +1,45 @@
+# weather_sw hyperparameter configuration
+
+data:
+  mode: real                  # real (Open-Meteo API) | synthetic
+  cities:
+    Kunming:   { lat: 25.04, lon: 102.68, elev: 1892 }
+    Guiyang:   { lat: 26.58, lon: 106.73, elev: 1223 }
+    Chengdu:   { lat: 30.57, lon: 104.07, elev: 508 }
+    Chongqing: { lat: 29.57, lon: 106.55, elev: 260 }
+  start_date: "2010-01-01"
+  # end_date auto = today (set via CLI: --end-date 2025-12-31)
+  features: [tavg, tmin, tmax, prcp, rhum, wspd, pres]
+  target: tavg
+
+window:
+  window_len: 30
+  horizon: 1
+
+split:
+  train_years_back: 3         # train: start_date -> (today - 3 years)
+  val_years_back:   2         # val:   ~2 years ago
+  test_years_back:  1         # test:  ~1 year ago to today
+
+model:
+  name: lstm1               # lstm1 | lstm2 | transformer
+  input_dim: 7
+  hidden_dim: 32              # 32 for speed, 64 for accuracy
+  num_layers: 1
+  dropout: 0.1
+  nhead: 4
+  dim_feedforward: 128
+  d_model: 32
+
+train:
+  loss: mae                  # mae | mse
+  optimizer: adam
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  batch_size: 64
+  epochs: 20
+  patience: 6
+  factor: 0.5
+  grad_clip_norm: 1.0
+  seed: 42
+  num_workers: 0
